@@ -1,0 +1,278 @@
+描述符是一种在多个属性上重复利用同一个存取逻辑的方式，他能"劫持"那些本对于self.__dict__的操作。描述符通常是一种包含__get__、__set__、__delete__三种方法中至少一种的类，给人的感觉是「把一个类的操作托付与另外一个类」。静态方法、类方法、property都是构建描述符的类。
+
+我们先看一个简单的描述符的例子（基于我之前的分享的Python高级编程改编，这个PPT建议大家去看看）：
+1. class MyDescriptor(object):
+2.     _value = ''
+3.     def __get__(self, instance, klass):
+4.         return self._value
+5.     def __set__(self, instance, value):
+6.         self._value = value.swapcase()
+7. class Swap(object):
+8.     swap = MyDescriptor()
+注意MyDescriptor要用新式类。调用一下：
+1. In [1]: from descriptor_example import Swap
+2. In [2]: instance = Swap()
+3. In [3]: instance.swap  # 没有报AttributeError错误，因为对swap的属性访问被描述符类重载了
+4. Out[3]: ''
+5. In [4]: instance.swap = 'make it swap'  # 使用__set__重新设置_value
+6. In [5]: instance.swap
+7. Out[5]: 'MAKE IT SWAP'
+8. In [6]: instance.__dict__  # 没有用到__dict__:被劫持了
+9. Out[6]: {}
+这就是描述符的威力。我们熟知的staticmethod、classmethod如果你不理解，那么看一下用Python实现的效果可能会更清楚了：
+1. >>> class myStaticMethod(object):
+2. ...     def __init__(self, method):
+3. ...         self.staticmethod = method
+4. ...     def __get__(self, object, type=None):
+5. ...         return self.staticmethod
+6. ...
+7. >>> class myClassMethod(object):
+8. ...     def __init__(self, method):
+9. ...         self.classmethod = method
+10. ...     def __get__(self, object, klass=None):
+11. ...         if klass is None:
+12. ...             klass = type(object)
+13. ...         def newfunc(*args):
+14. ...             return self.classmethod(klass, *args)
+15. ...         return newfunc
+在实际的生产项目中，描述符有什么用处呢？首先看MongoEngine中的Field的用法：
+1. from mongoengine import *                      
+2. class Metadata(EmbeddedDocument):                  
+3.    tags = ListField(StringField())
+4.    revisions = ListField(IntField())
+5. class WikiPage(Document):                          
+6.    title = StringField(required=True)              
+7.    text = StringField()                            
+8.    metadata = EmbeddedDocumentField(Metadata)
+有非常多的Field类型，其实它们的基类就是一个描述符，我简化下，大家看看实现的原理：
+1. class BaseField(object):
+2.    name = None
+3.    def __init__(self, **kwargs):
+4.        self.__dict__.update(kwargs)
+5.        ...
+6.    def __get__(self, instance, owner):
+7.        return instance._data.get(self.name)
+8.    def __set__(self, instance, value):
+9.        ...
+10.        instance._data[self.name] = value
+很多项目的源代码看起来很复杂，在抽丝剥茧之后，其实原理非常简单，复杂的是业务逻辑。
+接着我们再看Flask的依赖Werkzeug中的cached_property：
+1. class _Missing(object):
+2.    def __repr__(self):
+3.        return 'no value'
+4.    def __reduce__(self):
+5.        return '_missing'
+6. _missing = _Missing() 
+7. class cached_property(property):
+8.    def __init__(self, func, name=None, doc=None):
+9.        self.__name__ = name or func.__name__
+10.        self.__module__ = func.__module__
+11.        self.__doc__ = doc or func.__doc__
+12.        self.func = func
+13.    def __set__(self, obj, value):
+14.        obj.__dict__[self.__name__] = value
+15.    def __get__(self, obj, type=None):
+16.        if obj is None:
+17.            return self
+18.        value = obj.__dict__.get(self.__name__, _missing)
+19.        if value is _missing:
+20.            value = self.func(obj)
+21.            obj.__dict__[self.__name__] = value
+22.        return value
+其实看类的名字就知道这是缓存属性的，看不懂没关系，用一下：
+1. class Foo(object):
+2.    @cached_property
+3.    def foo(self):
+4.        print 'Call me!'
+5.        return 42
+调用下：
+1. In [1]: from cached_property import Foo
+2.   ...: foo = Foo()
+3.   ...:
+4. In [2]: foo.bar
+5. Call me!
+6. Out[2]: 42
+7. In [3]: foo.bar
+8. Out[3]: 42
+可以看到在从第二次调用bar方法开始，其实用的是缓存的结果，并没有真的去执行。
+说了这么多描述符的用法。我们写一个做字段验证的描述符：
+1. class Quantity(object):
+2.    def __init__(self, name):
+3.        self.name = name
+4.    def __set__(self, instance, value):
+5.        if value > 0:
+6.            instance.__dict__[self.name] = value
+7.        else:
+8.            raise ValueError('value must be > 0')
+9. class Rectangle(object):
+10.    height = Quantity('height')
+11.    width = Quantity('width')
+12.    def __init__(self, height, width):
+13.        self.height = height
+14.        self.width = width
+15.    @property
+16.    def area(self):
+17.        return self.height * self.width
+我们试一试：
+1. In [1]: from rectangle import Rectangle
+2. In [2]: r = Rectangle(10, 20)
+3. In [3]: r.area
+4. Out[3]: 200
+5. In [4]: r = Rectangle(-1, 20)
+6. ---------------------------------------------------------------------------
+7. ValueError                                Traceback (most recent call last)
+8. <ipython-input-5-5a7fc56e8a> in <module>()
+9. ----> 1 r = Rectangle(-1, 20)
+10. /Users/dongweiming/mp/2017-03-23/rectangle.py in __init__(self, height, width)
+11.     15
+12.     16     def __init__(self, height, width):
+13. ---> 17         self.height = height
+14.     18         self.width = width
+15.     19
+16. /Users/dongweiming/mp/2017-03-23/rectangle.py in __set__(self, instance, value)
+17.      7             instance.__dict__[self.name] = value
+18.      8         else:
+19. ----> 9             raise ValueError('value must be > 0')
+20.     10
+21.     11
+22. ValueError: value must be > 0
+看到了吧，我们在描述符的类里面对传值进行了验证。ORM就是这么玩的！
+但是上面的这个实现有个缺点，就是不太自动化，你看 height =Quantity('height')，这得让属性和Quantity的name都叫做height，那么可不可以不用指定name呢？当然可以，不过实现的要复杂很多：
+1. class Quantity(object):
+2.    __counter = 0
+3.    def __init__(self):
+4.        cls = self.__class__
+5.        prefix = cls.__name__
+6.        index = cls.__counter
+7.        self.name = '_{}#{}'.format(prefix, index)
+8.        cls.__counter += 1
+9.    def __get__(self, instance, owner):
+10.        if instance is None:
+11.            return self
+12.        return getattr(instance, self.name)
+13.    ...
+14. class Rectangle(object):
+15.    height = Quantity()
+16.    width = Quantity() 
+17.    ...
+Quantity的name相当于类名+计时器，这个计时器每调用一次就叠加1，用此区分。有一点值得提一提，在__get__中的：
+1. if instance is None:
+2.    return self
+在很多地方可见，比如之前提到的MongoEngine中的BaseField。这是由于直接调用Rectangle.height这样的属性时候会报AttributeError, 因为描述符是实例上的属性。
+PS：这个灵感来自《Fluent Python》，书中还有一个我认为设计非常好的例子。就是当要验证的内容种类很多的时候，如何更好地扩展的问题。现在假设我们除了验证传入的值要大于0，还得验证不能为空和必须是数字（当然三种验证在一个方法中验证也是可以接受的，我这里就是个演示），我们先写一个abc的基类：
+1. class Validated(abc.ABC):
+2.    __counter = 0
+3.    def __init__(self):
+4.        cls = self.__class__
+5.        prefix = cls.__name__
+6.        index = cls.__counter
+7.        self.name = '_{}#{}'.format(prefix, index)
+8.        cls.__counter += 1
+9.    def __get__(self, instance, owner):
+10.        if instance is None:
+11.            return self
+12.        else:
+13.            return getattr(instance, self.name)
+14.    def __set__(self, instance, value):
+15.        value = self.validate(instance, value)
+16.        setattr(instance, self.name, value) 
+17.    @abc.abstractmethod
+18.    def validate(self, instance, value):
+19.        """return validated value or raise ValueError"""
+现在新加一个检查类型，新增一个继承了Validated的、包含检查的validate方法的类就可以了：
+1. class Quantity(Validated):
+2.    def validate(self, instance, value):
+3.        if value <= 0:
+4.            raise ValueError('value must be > 0')
+5.        return value
+6. class NonBlank(Validated):
+7.    def validate(self, instance, value):
+8.        value = value.strip()
+9.        if len(value) == 0:
+10.            raise ValueError('value cannot be empty or blank')
+11.        return value
+前面展示的描述符都是一个类，那么可不可以用函数来实现呢？也是可以的：
+1. def quantity():
+2.    try:
+3.        quantity.counter += 1
+4.    except AttributeError:
+5.        quantity.counter = 0
+6.    storage_name = '_{}:{}'.format('quantity', quantity.counter)
+7.    def qty_getter(instance):
+8.        return getattr(instance, storage_name)
+9.    def qty_setter(instance, value):
+10.        if value > 0:
+11.            setattr(instance, storage_name, value)
+12.        else:
+13.            raise ValueError('value must be > 0')
+14.    return property(qty_getter, qty_setter)
+PS：本文全部代码可以在微信公众号文章代码库项目中找到。
+(https://github.com/dongweiming/mp/tree/master/2017-03-26)中找到。 
+
+
+
+描述符测试
+In [54]: class Desc(object):
+    ...:     def __get__(self, instance, owner):
+    ...:         print("__get__...")
+    ...:         print("self : \t\t", self)
+    ...:         print("instance : \t", instance)
+    ...:         print("owner : \t", owner)
+    ...:         print('='*40, "\n")
+    ...:
+    ...:     def __set__(self, instance, value):
+    ...:         print('__set__...')
+    ...:         print("self : \t\t", self)
+    ...:         print("instance : \t", instance)
+    ...:         print("value : \t", value)
+    ...:         print('='*40, "\n")
+
+In [55]:
+
+In [55]:
+
+In [55]:
+
+In [55]: class Test(object):
+    ...:     x = Desc()
+    ...:
+
+In [56]: t = Test()
+
+In [57]: t.x
+__get__...
+('self : \t\t', <__main__.Desc object at 0x108246c50>)
+('instance : \t', <__main__.Test object at 0x10833c290>)
+('owner : \t', <class '__main__.Test'>)
+('========================================', '\n')
+
+In [58]: t.x = 1
+__set__...
+('self : \t\t', <__main__.Desc object at 0x108246c50>)
+('instance : \t', <__main__.Test object at 0x10833c290>)
+('value : \t', 1)
+('========================================', '\n’)
+
+
+
+In [39]: class wraps(object):
+    ...:     def __init__(self, func):
+    ...:         self.func = func
+    ...:     def wrap(self, *arg, **kwarg):
+    ...:         import time
+    ...:         start = time.time()
+    ...:         self.func(*arg, **kwarg)
+    ...:         stop = time.time()
+    ...:         print(stop - start)
+    ...:     def __get__(self, obj, cls):
+    ...:         return self.wrap
+
+In [40]: class A(object):
+    ...:     def __init__(self):
+    ...:         pass
+    ...:     @wraps
+    ...:     def hello(name):
+    ...:         print('hello {}'.format(name))
+
+
+A.hello(‘xiaoming’)
